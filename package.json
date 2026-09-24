@@ -1,6 +1,6 @@
 {
-  "name": "@kushagharahi/pi-llama-extensions",
-  "version": "0.1.0",
+  "name": "@wombatfromhell/pi-llama-extensions",
+  "version": "0.1.2",
   "description": "Pi extensions for llama.cpp router — auto model discovery and tokens/second display",
   "keywords": [
     "pi-package",
@@ -8,13 +8,13 @@
     "llama-cpp"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-ai": "*"
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
   },
   "pi": {
     "extensions": [
       "./extensions"
     ],
-    "image": "https://raw.githubusercontent.com/kushagharahi/pi-llama-extensions/refs/heads/main/screenshot.png"
+    "image": "https://raw.githubusercontent.com/wombatfromhell/pi-llama-extensions/refs/heads/main/screenshot.png"
   }
 }

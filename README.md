@@ -1,6 +1,6 @@
 # [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extensions for [llama.cpp](https://github.com/ggerganov/llama.cpp) power users
 
-[![npm version](https://badge.fury.io/js/@kushagharahi%2Fpi-llama-extensions.svg)](https://badge.fury.io/js/@kushagharahi%2Fpi-llama-extensions)
+[![npm version](https://badge.fury.io/js/@wombatfromhell%2Fpi-llama-extensions.svg)](https://badge.fury.io/js/@wombatfromhell%2Fpi-llama-extensions)
 
 ## Features
 - Configure models only in llama.cpp
@@ -14,7 +14,7 @@
 
 ## Quick start
 ```
-pi install npm:@kushagharahi/pi-llama-extensions
+pi install git:github.com/WombatFromHell/pi-llama-extensions
 ```
 
 ### models.json config for auto model discovery in router mode

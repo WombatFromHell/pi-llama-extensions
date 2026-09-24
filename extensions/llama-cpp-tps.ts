@@ -1,5 +1,5 @@
-import type { Context } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import fs from "node:fs";
 
 const LOG_FILE = "/tmp/llama-cpp-tps.log";
@@ -13,15 +13,12 @@ const downArrow = "↓";
 const upArrow = "↑";
 
 interface LlamaCppTimings {
-	predicted_n?: number;
 	predicted_ms?: number;
 	predicted_per_second?: number;
-	prompt_n?: number;
 	prompt_ms?: number;
 	prompt_per_second?: number;
 }
 
-// Progress tracking
 interface ProgressData {
 	total?: number;
 	cache?: number;
@@ -30,12 +27,12 @@ interface ProgressData {
 	pct?: number;
 }
 
-// Store latest timing data per model
-const latestTimings = new Map<string, LlamaCppTimings>();
+// Store latest timing data (single model — the fetch interceptor only wraps one)
+let latestTimings: LlamaCppTimings | null = null;
 let lastTpsDisplay: string | null = null;
 
-// Store ctx from turn_start for use in SSE parsing loop (must be before captureTimings)
-let turnCtx: Context | null = null;
+// ctx from turn_start, used by the SSE parsing loop
+let turnCtx: ExtensionContext | null = null;
 
 function calcProgressPct(prog: ProgressData): number {
 	const cached = prog.cache ?? 0;
@@ -54,9 +51,9 @@ function formatTps(data: LlamaCppTimings): string | null {
 	if (!predicted || predicted <= 0) return null;
 
 	if (prompt && prompt > 0) {
-		return `Out: ${downArrow}${Number(predicted).toFixed(1)} tok/s${fmtTime(predictedMs) ? ` (${fmtTime(predictedMs)})` : ""} | In: ${upArrow}${Number(prompt).toFixed(1)} tok/s${fmtTime(promptMs) ? ` (${fmtTime(promptMs)})` : ""}`;
+		return `Out: ${downArrow}${predicted.toFixed(1)} tok/s${fmtTime(predictedMs) ? ` (${fmtTime(predictedMs)})` : ""} | In: ${upArrow}${prompt.toFixed(1)} tok/s${fmtTime(promptMs) ? ` (${fmtTime(promptMs)})` : ""}`;
 	}
-	return `${downArrow}${Number(predicted).toFixed(1)} tok/s${fmtTime(predictedMs) ? ` (${fmtTime(predictedMs)})` : ""}`;
+	return `${downArrow}${predicted.toFixed(1)} tok/s${fmtTime(predictedMs) ? ` (${fmtTime(predictedMs)})` : ""}`;
 }
 
 function fmtTime(ms: number | undefined): string {
@@ -67,7 +64,6 @@ function fmtTime(ms: number | undefined): string {
 	return `${(ms / 1000).toFixed(1).replace(/\.0$/, "")}s`;
 }
 
-// ─── Intercept fetch to capture llama.cpp timing data from SSE chunks ───
 function captureTimings(
 	modelId: string,
 	body: ReadableStream<Uint8Array>,
@@ -97,7 +93,7 @@ function captureTimings(
 					try {
 						const chunk = JSON.parse(jsonStr);
 						if (chunk.timings) {
-							latestTimings.set(modelId, chunk.timings);
+							latestTimings = chunk.timings;
 							log("TIMINGS captured:", JSON.stringify(chunk.timings));
 						}
 						if (chunk.prompt_progress) {
@@ -106,21 +102,20 @@ function captureTimings(
 							prog.pct = calcProgressPct(prog);
 
 							if (!turnCtx) {
-								fs.appendFileSync(LOG_FILE, "[PROGRESS] t=" + Date.now() + " turnCtx is NULL\n");
+								log("[PROGRESS] turnCtx is NULL");
 							} else if (!turnCtx.hasUI) {
-								fs.appendFileSync(LOG_FILE, "[PROGRESS] t=" + Date.now() + " turnCtx.hasUI is false\n");
+								log("[PROGRESS] turnCtx.hasUI is false");
 							} else {
 								try {
 									const msg = `Working... | Prompt Processing ${prog.pct}%`;
 									turnCtx.ui.setWorkingMessage(msg);
-									fs.appendFileSync(LOG_FILE, "[PROGRESS] t=" + Date.now() + " setWorkingMessage: [" + msg + "]\n");
+									log("[PROGRESS] setWorkingMessage:", msg);
 								} catch (err) {
-									fs.appendFileSync(LOG_FILE, "[PROGRESS] setWorkingMessage ERROR: " + String(err) + "\n");
+									log("[PROGRESS] setWorkingMessage ERROR:", String(err));
 								}
 							}
 
-							log("PROGRESS:", prog.processed, "/", prog.total, "cache:", prog.cache ?? 0, "pct:", prog.pct + "%");
-							fs.appendFileSync("/tmp/llama-cpp-tps-progress.log", JSON.stringify({ ...prog, pct: prog.pct }) + "\n");
+							log("PROGRESS:", prog.processed, "/", prog.total, "cache:", prog.cache ?? 0, "pct:", prog.pct + "%", "time_ms:", prog.time_ms);
 						}
 
 					} catch {
@@ -142,10 +137,7 @@ function captureTimings(
 }
 
 
-// ─── Extension Entry Point ─────────────────────
 export default function (pi: ExtensionAPI) {
-	log("Current registered providers:", Array.from(pi.events.listeners ? [] : []).join(", "));
-
 	log("globalThis.fetch exists:", typeof globalThis.fetch);
 	const originalFetch = globalThis.fetch;
 	log("saved originalFetch:", typeof originalFetch);
@@ -171,28 +163,19 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", (event, ctx) => {
 		log("turn_end fired - hasUI:", ctx.hasUI);
 
-		const keys = Array.from(latestTimings.keys());
-		if (keys.length === 0) {
-			log("turn_end - no timings, nothing to display");
+		if (!latestTimings || !latestTimings.predicted_per_second) {
+			log("turn_end - no valid timings");
 			return;
 		}
 
-		const latestModelId = keys[keys.length - 1];
-		const timings = latestTimings.get(latestModelId);
-
-		if (!timings || !timings.predicted_per_second) {
-			log("turn_end - no valid timings for", latestModelId);
-			return;
-		}
-
-		const display = formatTps(timings);
+		const display = formatTps(latestTimings);
 
 		if (display && ctx.hasUI) {
 			if (display !== lastTpsDisplay) {
 				lastTpsDisplay = display;
-				ctx.ui.setStatus("llama-cpp-tps", display);
+				ctx.ui.setWidget("llama-cpp-tps", (_tui, theme) => new Text(theme.fg("text", display), 1, 0), { placement: "belowEditor" });
 				ctx.ui.notify(`TPS: ${display}`);
-				log("turn_end - Set status:", display);
+				log("turn_end - Set widget:", display);
 			}
 		}
 
@@ -200,12 +183,15 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_start", (event, ctx) => {
 		turnCtx = ctx;
+		latestTimings = null;
+		lastTpsDisplay = null;
 		log("turn_start fired, hasUI:", ctx.hasUI);
 	});
 
 	pi.on("before_provider_request", (event) => {
+		if (turnCtx?.model?.provider !== "llama-cpp") return;
 		const payload = event.payload as Record<string, unknown> | undefined;
-		if (!payload || typeof payload !== "object") return;
+		if (!payload) return;
 		log("before_provider_request: adding timings_per_token + return_progress to payload");
 		const newPayload: any = { ...payload, timings_per_token: true, return_progress: true };
 		return newPayload;
@@ -213,7 +199,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		log("session_shutdown: clearing state");
-		latestTimings.clear();
+		latestTimings = null;
 		lastTpsDisplay = null;
 
 		globalThis.fetch = originalFetch;

@@ -2,9 +2,9 @@
  * Extension: Auto-discover models from llama.cpp router server.
  * 
  * Replaces the "models" array in models.json. The user only needs to specify
- * baseUrl and api at the provider level - the extension queries /v1/models for
- * the list, then /props?model=<name> for each to get runtime config,
- * and registers them.
+ * baseUrl and api at the provider level - the extension probes /props to
+ * confirm router mode, then queries /models for the list with runtime
+ * config, and registers them.
  * 
  * Minimal models.json:
 {
@@ -23,12 +23,12 @@
 	}
  */
 
+import type { Api, Model } from "@mariozechner/pi-ai";
 import type {
-	Api,
 	ExtensionContext,
 	ExtensionAPI,
-	Model,
-	ProviderConfigInput
+	ProviderConfig,
+	ProviderModelConfig
 } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs";
 
@@ -47,47 +47,33 @@ const PROVIDER = "llama-cpp"
 const MODEL_ID = "llama-cpp-discover"
 
 interface modelStatus {
-	value: string;
 	args: string[];
-	preset: string;
 }
 
 interface modelData {
 	id: string;
-	aliases: string[];
-	tags: string[];
-	object: string;
-	owned_by: string;
-	created: number; // Unix timestamp
 	status: modelStatus;
 }
 
 interface llamaCppModels {
 	data: modelData[];
-	object: "list";
 }
 
-/** 
- * A generic utility to convert a flat array of CLI-style arguments 
- * into a searchable key-value dictionary.
- */
 function parseArgsToMap(args: string[]): Record<string, string> {
 	const map: Record<string, string> = {};
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 
-		// Check if the item is a flag (starts with --)
 		if (arg.startsWith("--")) {
-			const key = arg.replace(/^--/, ""); // Remove the '--' prefix
+			const key = arg.replace(/^--/, "");
 			const nextValue = args[i + 1];
 
-			// If the next element exists and isn't another flag, it's our value
 			if (nextValue !== undefined && !nextValue.startsWith("--")) {
 				map[key] = nextValue;
-				i++; // Skip the next index because we just consumed it as a value
+				i++; // consumed the value
 			} else {
-				// It's a boolean flag (e.g., "--flash-attn") with no explicit value provided
+				// boolean flag — no value
 				map[key] = "true";
 			}
 		}
@@ -96,35 +82,25 @@ function parseArgsToMap(args: string[]): Record<string, string> {
 	return map;
 }
 
-/** 
- * Helper: Converts kebab-case ID into Title Case name.
- */
 function formatModelName(id: string): string {
 	return id.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
-/** 
- * Main Transformation Function 
- */
-function transformLlamaCppModels(input: llamaCppModels): ProviderModelConfig.models[] {
+function transformLlamaCppModels(input: llamaCppModels): ProviderModelConfig[] {
 	return input.data.map((model) => {
-		// Use the generic parser once per model
 		const args = parseArgsToMap(model.status.args);
 
 		return {
 			id: model.id,
 			name: formatModelName(model.id),
-			// Access values from the map using their flag names (without --)
 			contextWindow: args["ctx-size"] ? parseInt(args["ctx-size"], 10) : 0,
 			maxTokens: (args["n_predict"] || args["ctx-size"])
 				? parseInt(args["n_predict"] || args["ctx-size"], 10)
 				: 0,
 
-			// hardcoded below
-			// if not defined:  Error: Cannot read properties of undefined (reading 'includes')
-			// see: https://github.com/badlogic/pi-mono/issues/1167
-			// and: https://github.com/badlogic/pi-mono/issues/1028
-			input: "text",
+			// Hardcoded: crashes without it ("Cannot read 'includes'") —
+			// https://github.com/badlogic/pi-mono/issues/1167, https://github.com/badlogic/pi-mono/issues/1028
+			input: ["text"],
 			cost: {
 				input: 0,
 				output: 0,
@@ -137,21 +113,18 @@ function transformLlamaCppModels(input: llamaCppModels): ProviderModelConfig.mod
 }
 
 export default function (pi: ExtensionAPI) {
-	let currentCtx: ExtensionContext | undefined;
-
 	pi.on("session_start", async (_event, ctx) => {
-		currentCtx = ctx;
-		discoverAndRegister();
+		discoverAndRegister(ctx);
 	});
 
-	async function discoverAndRegister(): Promise<void> {
+	async function discoverAndRegister(ctx: ExtensionContext): Promise<void> {
 		try {
-			let registeredModels: Model<Api>[] = currentCtx.modelRegistry.getAvailable()
+			const registeredModels: Model<Api>[] = ctx.modelRegistry.getAvailable()
 			log("registered models", JSON.stringify(registeredModels))
 
-			let discoveryModels = registeredModels.filter(m => m.provider == PROVIDER && m.id == MODEL_ID)
+			const discoveryModels = registeredModels.filter(m => m.provider === PROVIDER && m.id === MODEL_ID)
 
-			if (discoveryModels.length != 1) {
+			if (discoveryModels.length !== 1) {
 				notify(`Found ${discoveryModels.length} llama - cpp providers / models.Only one should be specified in the shape of:
 		{
 			"providers": {
@@ -166,12 +139,12 @@ export default function (pi: ExtensionAPI) {
 				]
 			}
 		}
-} `, currentCtx)
+} `, ctx)
 				return;
 			}
 
 			const discoveryModel = discoveryModels[0];
-			const apiKeyAndHeaders = await currentCtx.modelRegistry.getApiKeyAndHeaders({ provider: PROVIDER, id: MODEL_ID })
+			const apiKeyAndHeaders = await ctx.modelRegistry.getApiKeyAndHeaders(discoveryModel)
 			if (!apiKeyAndHeaders.ok) {
 				throw new Error(apiKeyAndHeaders.error);
 			}
@@ -181,10 +154,9 @@ export default function (pi: ExtensionAPI) {
 				discoveryHeaders.set("Authorization", `Bearer ${apiKeyAndHeaders.apiKey}`);
 			}
 
-			// Check router mode first — /models/load only exists in router mode (server.cpp:168)
 			const isRouter = await checkRouterMode(discoveryModel.baseUrl, discoveryHeaders);
 			if (!isRouter) {
-				notify("server is not in router mode", currentCtx);
+				notify("server is not in router mode", ctx);
 				return;
 			}
 			const url = `${discoveryModel.baseUrl}/models`;
@@ -201,29 +173,28 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (llamaCppModels.data.length === 0) {
-				notify(`Server returned no models`, currentCtx);
+				notify(`Server returned no models`, ctx);
+				return;
 			}
 
 			log(`Got models from llama-cpp: ${JSON.stringify(llamaCppModels)}`)
 
-			let autoDiscoveredModels = transformLlamaCppModels(llamaCppModels)
+			const autoDiscoveredModels = transformLlamaCppModels(llamaCppModels)
 			log(`autoDiscoveredModels ${JSON.stringify(autoDiscoveredModels)}`)
 
-			let updatedProvider: ProviderConfigInput = {
+			const updatedProvider: ProviderConfig = {
 				baseUrl: discoveryModel.baseUrl,
 				apiKey: apiKeyAndHeaders.apiKey,
 				api: discoveryModel.api,
 				headers: apiKeyAndHeaders.headers,
-				// //AUTHHEADER NOT SUPPORTED
-				// //OAUTH NOT SUPPORTED
 				models: autoDiscoveredModels
 			}
-			const wasOnDiscoverModel = currentCtx.model?.provider === PROVIDER && currentCtx.model?.id === MODEL_ID
+			const wasOnDiscoverModel = ctx.model?.provider === PROVIDER && ctx.model?.id === MODEL_ID
 
 			pi.registerProvider(PROVIDER, updatedProvider)
 
 			if (wasOnDiscoverModel && autoDiscoveredModels.length > 0) {
-				const firstModel = currentCtx.modelRegistry.find(PROVIDER, autoDiscoveredModels[0].id)
+				const firstModel = ctx.modelRegistry.find(PROVIDER, autoDiscoveredModels[0].id)
 				if (firstModel) {
 					pi.setModel(firstModel)
 				}
@@ -231,12 +202,11 @@ export default function (pi: ExtensionAPI) {
 
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			notify(`Failed to discover models: ${msg}`, currentCtx);
+			notify(`Failed to discover models: ${msg}`, ctx);
 		}
 	}
 
 
-	// Probe /props — identifies router mode
 	async function checkRouterMode(baseUrl: string, headers: Headers): Promise<boolean> {
 		let res: Response;
 		try {
@@ -246,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (!res.ok) {
-			throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+			return false;
 		}
 		const body = await res.json();
 		return body.role === "router";
