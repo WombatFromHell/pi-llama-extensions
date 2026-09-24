@@ -149,10 +149,10 @@ export default function (pi: ExtensionAPI) {
 			let registeredModels: Model<Api>[] = currentCtx.modelRegistry.getAvailable()
 			log("registered models", JSON.stringify(registeredModels))
 
-			let llamaProvider = registeredModels.filter(m => m.provider == PROVIDER && m.id == MODEL_ID)
+			let discoveryModels = registeredModels.filter(m => m.provider == PROVIDER && m.id == MODEL_ID)
 
-			if (llamaProvider.length != 1) {
-				notify(`Found ${llamaProvider.length} llama - cpp providers / models.Only one should be specified in the shape of:
+			if (discoveryModels.length != 1) {
+				notify(`Found ${discoveryModels.length} llama - cpp providers / models.Only one should be specified in the shape of:
 		{
 			"providers": {
 				"${PROVIDER}": { < --- key
@@ -167,25 +167,37 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 } `, currentCtx)
+				return;
+			}
+
+			const discoveryModel = discoveryModels[0];
+			const apiKeyAndHeaders = await currentCtx.modelRegistry.getApiKeyAndHeaders({ provider: PROVIDER, id: MODEL_ID })
+			if (!apiKeyAndHeaders.ok) {
+				throw new Error(apiKeyAndHeaders.error);
+			}
+
+			const discoveryHeaders = new Headers(apiKeyAndHeaders.headers);
+			if (apiKeyAndHeaders.apiKey && !discoveryHeaders.has("authorization")) {
+				discoveryHeaders.set("Authorization", `Bearer ${apiKeyAndHeaders.apiKey}`);
 			}
 
 			// Check router mode first — /models/load only exists in router mode (server.cpp:168)
-			const isRouter = await checkRouterMode(llamaProvider[0].baseUrl);
+			const isRouter = await checkRouterMode(discoveryModel.baseUrl, discoveryHeaders);
 			if (!isRouter) {
 				notify("server is not in router mode", currentCtx);
 				return;
 			}
-			const url = `${llamaProvider[0].baseUrl}/models`;
+			const url = `${discoveryModel.baseUrl}/models`;
 			log(`Querying ${url}`);
 
-			const response = await fetch(url);
+			const response = await fetch(url, { headers: discoveryHeaders });
 			if (!response.ok) {
-				notify(`HTTP ${response.status}: ${response.statusText}`, currentCtx);
+				throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 			}
 
 			const llamaCppModels: llamaCppModels = await response.json();
 			if (!llamaCppModels.data || !Array.isArray(llamaCppModels.data)) {
-				notify("Invalid response format from llama.cpp server", currentCtx);
+				throw new Error("Invalid response format from llama.cpp server");
 			}
 
 			if (llamaCppModels.data.length === 0) {
@@ -197,13 +209,11 @@ export default function (pi: ExtensionAPI) {
 			let autoDiscoveredModels = transformLlamaCppModels(llamaCppModels)
 			log(`autoDiscoveredModels ${JSON.stringify(autoDiscoveredModels)}`)
 
-			const apiKeyAndHeaders = await currentCtx.modelRegistry.getApiKeyAndHeaders({ provider: PROVIDER, id: MODEL_ID })
-
 			let updatedProvider: ProviderConfigInput = {
-				baseUrl: llamaProvider[0].baseUrl,
-				apiKey: apiKeyAndHeaders?.apiKey,
-				api: llamaProvider[0]?.api,
-				headers: apiKeyAndHeaders?.headers,
+				baseUrl: discoveryModel.baseUrl,
+				apiKey: apiKeyAndHeaders.apiKey,
+				api: discoveryModel.api,
+				headers: apiKeyAndHeaders.headers,
 				// //AUTHHEADER NOT SUPPORTED
 				// //OAUTH NOT SUPPORTED
 				models: autoDiscoveredModels
@@ -226,17 +236,19 @@ export default function (pi: ExtensionAPI) {
 	}
 
 
-	// Probe /models/load — registered only in router mode (server.cpp:168)
-	async function checkRouterMode(baseUrl: string): Promise<boolean> {
+	// Probe /props — identifies router mode
+	async function checkRouterMode(baseUrl: string, headers: Headers): Promise<boolean> {
+		let res: Response;
 		try {
-			const res = await fetch(`${baseUrl}/props`);
-			if (!res.ok) return false;
-			const body = await res.json();
-			return body.role === "router";
+			res = await fetch(`${baseUrl}/props`, { headers });
 		} catch {
-			log(`Failed to probe ${baseUrl}/models/load`);
+			log(`Failed to probe ${baseUrl}/props`);
 			return false;
-
 		}
+		if (!res.ok) {
+			throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+		}
+		const body = await res.json();
+		return body.role === "router";
 	}
 }
